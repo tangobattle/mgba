@@ -1,0 +1,11 @@
+sljit — platform-independent low-level JIT compiler
+https://github.com/zherczeg/sljit
+
+Vendored from upstream commit d74aa8871c65c66d84b0c62a91839903d437356d (2026-06-06).
+Only sljit_src/ and LICENSE are vendored; tests, regex engine, and docs are omitted.
+
+Used by the ARM dynarec (src/arm/dynarec/) when ENABLE_DYNAREC is on.
+Compiled as a single translation unit (sljit_src/sljitLir.c) with
+SLJIT_CONFIG_AUTO; the bundled executable-memory allocator handles
+W^X (including macOS MAP_JIT/pthread_jit_write_protect_np) and
+instruction-cache flushing.

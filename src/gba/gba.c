@@ -8,6 +8,7 @@
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/debugger/debugger.h>
 #include <mgba/internal/arm/decoder.h>
+#include <mgba/internal/arm/dynarec/dynarec.h>
 
 #include <mgba/internal/gba/bios.h>
 #include <mgba/internal/gba/cheats.h>
@@ -138,6 +139,8 @@ static void GBAInit(void* cpu, struct mCPUComponent* component) {
 }
 
 void GBAUnloadROM(struct GBA* gba) {
+	// Compiled ROM blocks reference the buffer being unloaded
+	ARMDynarecFlush(gba->cpu);
 	GBAMemoryClearAGBPrint(gba);
 	if (gba->memory.unl.type) {
 		GBAUnlCartUnload(gba);
@@ -552,6 +555,8 @@ void GBALoadBIOS(struct GBA* gba, struct VFile* vf) {
 	if (gba->memory.activeRegion == GBA_REGION_BIOS) {
 		gba->cpu->memory.activeRegion = gba->memory.bios;
 	}
+	// Compiled BIOS blocks reference the replaced buffer
+	ARMDynarecFlush(gba->cpu);
 }
 
 void GBAApplyPatch(struct GBA* gba, struct Patch* patch) {
@@ -579,6 +584,8 @@ void GBAApplyPatch(struct GBA* gba, struct Patch* patch) {
 	gba->memory.romSize = patchedSize;
 	gba->memory.romMask = toPow2(patchedSize) - 1;
 	gba->romCrc32 = doCrc32(gba->memory.rom, gba->memory.romSize);
+	// Compiled ROM blocks reference the replaced buffer
+	ARMDynarecFlush(gba->cpu);
 }
 
 void GBARaiseIRQ(struct GBA* gba, enum GBAIRQ irq, uint32_t cyclesLate) {

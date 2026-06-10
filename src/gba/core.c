@@ -9,6 +9,7 @@
 #include <mgba/core/log.h>
 #include <mgba/core/serialize.h>
 #include <mgba/internal/arm/debugger/debugger.h>
+#include <mgba/internal/arm/dynarec/dynarec.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/debugger/symbols.h>
 #include <mgba/internal/gba/cheats.h>
@@ -383,6 +384,37 @@ static void _GBACoreLoadConfig(struct mCore* core, const struct mCoreConfig* con
 	}
 
 	mCoreConfigGetBoolValue(config, "allowOpposingDirections", &gba->allowOpposingDirections);
+
+#ifdef ENABLE_DYNAREC
+	struct ARMCore* cpu = core->cpu;
+	bool dynarec = false;
+	mCoreConfigGetBoolValue(config, "cpu.dynarec", &dynarec);
+	if (dynarec && !cpu->dynarec) {
+		ARMDynarecInit(cpu);
+		cpu->dynarec->mapAddress = GBADynarecMapAddress;
+		cpu->dynarec->isWritable = GBADynarecIsWritable;
+		cpu->dynarec->emitMemory = GBADynarecEmitMemory;
+		cpu->dynarec->emitMultiple = GBADynarecEmitMultiple;
+		cpu->dynarec->branchPrefetchReset = &gba->memory.lastPrefetchedPc;
+		GBADynarecInitStubs(cpu);
+	} else if (!dynarec && cpu->dynarec) {
+		ARMDynarecDeinit(cpu);
+	}
+	if (cpu->dynarec) {
+		int maxBlockLength = 0;
+		if (mCoreConfigGetIntValue(config, "cpu.dynarec.maxBlockLength", &maxBlockLength) && maxBlockLength > 0) {
+			if (maxBlockLength > ARM_DYNAREC_MAX_BLOCK_LENGTH) {
+				maxBlockLength = ARM_DYNAREC_MAX_BLOCK_LENGTH;
+			}
+			cpu->dynarec->maxBlockLength = maxBlockLength;
+		}
+	}
+	if (cpu->dynarec) {
+		// Idle-loop detection assumes interpreter-driven jump patterns
+		gba->idleOptimization = IDLE_LOOP_IGNORE;
+	}
+	mCoreConfigCopyValue(&core->config, config, "cpu.dynarec");
+#endif
 
 	mCoreConfigCopyValue(&core->config, config, "allowOpposingDirections");
 	mCoreConfigCopyValue(&core->config, config, "gba.bios");
@@ -845,17 +877,28 @@ static void _GBACoreReset(struct mCore* core) {
 	mTimingInterrupt(&gba->timing);
 }
 
+static void _GBACoreRunLoopOnce(struct mCore* core) {
+#ifdef ENABLE_DYNAREC
+	struct ARMCore* cpu = core->cpu;
+	if (cpu->dynarec && !core->debugger) {
+		ARMDynarecRunLoop(cpu);
+		return;
+	}
+#endif
+	ARMRunLoop(core->cpu);
+}
+
 static void _GBACoreRunFrame(struct mCore* core) {
 	struct GBA* gba = core->board;
 	uint32_t frameCounter = gba->video.frameCounter;
 	uint32_t startCycle = mTimingCurrentTime(&gba->timing);
 	while (gba->video.frameCounter == frameCounter && mTimingCurrentTime(&gba->timing) - startCycle < VIDEO_TOTAL_LENGTH + VIDEO_HORIZONTAL_LENGTH) {
-		ARMRunLoop(core->cpu);
+		_GBACoreRunLoopOnce(core);
 	}
 }
 
 static void _GBACoreRunLoop(struct mCore* core) {
-	ARMRunLoop(core->cpu);
+	_GBACoreRunLoopOnce(core);
 }
 
 static void _GBACoreStep(struct mCore* core) {

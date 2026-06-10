@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/gba/serialize.h>
 
+#include <mgba/internal/arm/dynarec/dynarec.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/gba/bios.h>
 #include <mgba/internal/gba/io.h>
@@ -238,6 +239,10 @@ bool GBADeserialize(struct GBA* gba, const struct GBASerializedState* state) {
 	}
 
 	mTimingInterrupt(&gba->timing);
+
+	// RAM contents were rewritten wholesale; compiled code from writable
+	// memory revalidates lazily against its recorded source bytes
+	ARMDynarecOnLoadState(gba->cpu);
 
 	return true;
 }

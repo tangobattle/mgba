@@ -6,6 +6,7 @@
 #include <mgba/internal/gba/memory.h>
 
 #include <mgba/internal/arm/decoder.h>
+#include <mgba/internal/arm/dynarec/dynarec.h>
 #include <mgba/internal/arm/macros.h>
 #include <mgba/internal/defines.h>
 #include <mgba/internal/gba/gba.h>
@@ -29,7 +30,6 @@ static uint8_t _deadbeef[4] = { 0x10, 0xB7, 0x10, 0xE7 }; // Illegal instruction
 static const uint32_t _agbPrintFunc = 0x4770DFFA; // swi 0xFA; bx lr
 
 static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t region);
-static int32_t GBAMemoryStall(struct ARMCore* cpu, int32_t wait);
 static int32_t GBAMemoryStallVRAM(struct GBA* gba, int32_t wait, int extra);
 
 static const char GBA_BASE_WAITSTATES[16] = { 0, 0, 2, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4 };
@@ -822,12 +822,37 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 #define STORE_BAD \
 	mLOG(GBA_MEM, GAME_ERROR, "Bad memory Store32: 0x%08X", address);
 
+#ifdef ENABLE_DYNAREC
+static void _dynarecNotifyStore(struct ARMCore* cpu, uint32_t address, uint32_t length) {
+	if (UNLIKELY(cpu->dynarec)) {
+		uint32_t canonical = GBADynarecMapAddress(cpu, address);
+		if (canonical != ARM_DYNAREC_UNCACHEABLE) {
+			ARMDynarecNotifyStore(cpu, canonical, length);
+		}
+	}
+}
+
+static void _dynarecNotifyPatch(struct ARMCore* cpu, uint32_t address, uint32_t length) {
+	if (cpu->dynarec) {
+		uint32_t canonical = GBADynarecMapAddress(cpu, address);
+		if (canonical != ARM_DYNAREC_UNCACHEABLE) {
+			ARMDynarecInvalidateRange(cpu, canonical, length);
+		}
+	}
+}
+#else
+#define _dynarecNotifyStore(CPU, ADDRESS, LENGTH)
+#define _dynarecNotifyPatch(CPU, ADDRESS, LENGTH)
+#endif
+
 void GBAStore32(struct ARMCore* cpu, uint32_t address, int32_t value, int* cycleCounter) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
 	int wait = 0;
 	int32_t oldValue;
 	char* waitstatesRegion = memory->waitstatesNonseq32;
+
+	_dynarecNotifyStore(cpu, address, 4);
 
 	switch (address >> BASE_OFFSET) {
 	case GBA_REGION_EWRAM:
@@ -879,6 +904,8 @@ void GBAStore16(struct ARMCore* cpu, uint32_t address, int16_t value, int* cycle
 	struct GBAMemory* memory = &gba->memory;
 	int wait = 0;
 	int16_t oldValue;
+
+	_dynarecNotifyStore(cpu, address, 2);
 
 	switch (address >> BASE_OFFSET) {
 	case GBA_REGION_EWRAM:
@@ -1024,6 +1051,8 @@ void GBAStore8(struct ARMCore* cpu, uint32_t address, int8_t value, int* cycleCo
 	struct GBAMemory* memory = &gba->memory;
 	int wait = 0;
 	uint16_t oldValue;
+
+	_dynarecNotifyStore(cpu, address, 1);
 
 	switch (address >> BASE_OFFSET) {
 	case GBA_REGION_EWRAM:
@@ -1286,6 +1315,7 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08X", address);
 		break;
 	}
+	_dynarecNotifyPatch(cpu, address, 4);
 	if (old) {
 		*old = oldValue;
 	}
@@ -1356,6 +1386,7 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 		mLOG(GBA_MEM, WARN, "Bad memory Patch16: 0x%08X", address);
 		break;
 	}
+	_dynarecNotifyPatch(cpu, address, 2);
 	if (old) {
 		*old = oldValue;
 	}
@@ -1442,10 +1473,57 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
 		mLOG(GBA_MEM, WARN, "Bad memory Patch8: 0x%08X", address);
 		break;
 	}
+	_dynarecNotifyPatch(cpu, address, 1);
 	if (old) {
 		*old = oldValue;
 	}
 }
+
+#ifdef ENABLE_DYNAREC
+uint32_t GBADynarecMapAddress(struct ARMCore* cpu, uint32_t address) {
+	UNUSED(cpu);
+	switch (address >> BASE_OFFSET) {
+	case GBA_REGION_BIOS:
+		if (address < GBA_SIZE_BIOS) {
+			return address;
+		}
+		return ARM_DYNAREC_UNCACHEABLE;
+	case GBA_REGION_EWRAM:
+		return GBA_BASE_EWRAM | (address & (GBA_SIZE_EWRAM - 1));
+	case GBA_REGION_IWRAM:
+		return GBA_BASE_IWRAM | (address & (GBA_SIZE_IWRAM - 1));
+	case GBA_REGION_PALETTE_RAM:
+		return GBA_BASE_PALETTE_RAM | (address & (GBA_SIZE_PALETTE_RAM - 1));
+	case GBA_REGION_VRAM:
+		address &= 0x0001FFFF;
+		if (address >= GBA_SIZE_VRAM) {
+			address &= 0x00017FFF;
+		}
+		return GBA_BASE_VRAM | address;
+	case GBA_REGION_OAM:
+		return GBA_BASE_OAM | (address & (GBA_SIZE_OAM - 1));
+	case GBA_REGION_ROM0:
+	case GBA_REGION_ROM0_EX:
+	case GBA_REGION_ROM1:
+	case GBA_REGION_ROM1_EX:
+	case GBA_REGION_ROM2:
+	case GBA_REGION_ROM2_EX: {
+		// Fold both the three waitstate regions and any in-region mirroring
+		// of small ROMs so patches hit every alias
+		struct GBA* gba = (struct GBA*) cpu->master;
+		uint32_t mask = gba->memory.romMask ? gba->memory.romMask : GBA_SIZE_ROM0 - 1;
+		return GBA_BASE_ROM0 | (address & mask);
+	}
+	default:
+		return ARM_DYNAREC_UNCACHEABLE;
+	}
+}
+
+bool GBADynarecIsWritable(struct ARMCore* cpu, uint32_t canonical) {
+	UNUSED(cpu);
+	return canonical >= GBA_BASE_EWRAM && canonical < GBA_BASE_ROM0;
+}
+#endif
 
 #define LDM_LOOP(LDM) \
 	if (UNLIKELY(!mask)) { \
@@ -1628,6 +1706,11 @@ uint32_t GBAStoreMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum 
 		address &= 0xFFFFFFFC;
 	}
 	int wait = memory->waitstatesSeq32[region] - memory->waitstatesNonseq32[region];
+
+#ifdef ENABLE_DYNAREC
+	int storeCount = popcount ? popcount : popcount32(mask);
+	_dynarecNotifyStore(cpu, address, storeCount ? (uint32_t) storeCount << 2 : 4);
+#endif
 
 	switch (region) {
 	case GBA_REGION_EWRAM:

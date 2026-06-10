@@ -164,10 +164,25 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* old);
 void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old);
 
+#ifdef ENABLE_DYNAREC
+uint32_t GBADynarecMapAddress(struct ARMCore* cpu, uint32_t address);
+bool GBADynarecIsWritable(struct ARMCore* cpu, uint32_t canonical);
+struct ARMDynarecEmitContext;
+enum ARMDynarecMemOp;
+void GBADynarecEmitMemory(struct ARMCore* cpu, struct ARMDynarecEmitContext* ctx, enum ARMDynarecMemOp op, int rd,
+                          bool isArm, uint32_t instrAddress, uint32_t prefetch0, uint32_t prefetch1);
+void GBADynarecEmitMultiple(struct ARMCore* cpu, struct ARMDynarecEmitContext* ctx, bool isLoad, uint32_t mask,
+                            int baseReg, int direction, int writeback, bool isArm, uint32_t instrAddress,
+                            uint32_t prefetch0, uint32_t prefetch1);
+void GBADynarecInitStubs(struct ARMCore* cpu);
+#endif
+
 uint32_t GBALoadMultiple(struct ARMCore*, uint32_t baseAddress, int mask, enum LSMDirection direction,
                          int* cycleCounter);
 uint32_t GBAStoreMultiple(struct ARMCore*, uint32_t baseAddress, int mask, enum LSMDirection direction,
                           int* cycleCounter);
+
+int32_t GBAMemoryStall(struct ARMCore* cpu, int32_t wait);
 
 void GBAAdjustWaitstates(struct GBA* gba, uint16_t parameters);
 void GBAAdjustEWRAMWaitstates(struct GBA* gba, uint16_t parameters);

@@ -165,6 +165,8 @@ struct ARMRegisterFile {
 	ARM_REGISTER_FILE;
 };
 
+struct ARMDynarec;
+
 struct ARMCore {
 	union {
 		struct ARMRegisterFile regs;
@@ -193,6 +195,8 @@ struct ARMCore {
 
 	size_t numComponents;
 	struct mCPUComponent** components;
+
+	struct ARMDynarec* dynarec;
 };
 #undef ARM_REGISTER_FILE
 
@@ -209,6 +213,9 @@ void ARMRaiseSWI(struct ARMCore*);
 void ARMRaiseUndefined(struct ARMCore*);
 
 void ARMRun(struct ARMCore* cpu);
+// Executes exactly one instruction without processing events; the caller is
+// responsible for honoring cycles/nextEvent like ARMRunLoop does
+void ARMRunOne(struct ARMCore* cpu);
 void ARMRunLoop(struct ARMCore* cpu);
 void ARMRunFake(struct ARMCore* cpu, uint32_t opcode);
 

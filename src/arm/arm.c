@@ -5,6 +5,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 #include <mgba/internal/arm/arm.h>
 
+#include <mgba/internal/arm/dynarec/dynarec.h>
 #include <mgba/internal/arm/isa-arm.h>
 #include <mgba/internal/arm/isa-inlines.h>
 #include <mgba/internal/arm/isa-thumb.h>
@@ -45,6 +46,7 @@ void ARMSetPrivilegeMode(struct ARMCore* cpu, enum PrivilegeMode mode) {
 }
 
 void ARMInit(struct ARMCore* cpu) {
+	cpu->dynarec = NULL;
 	memset(cpu->cp, 0, sizeof(cpu->cp));
 	cpu->master->init(cpu, cpu->master);
 	size_t i;
@@ -56,6 +58,7 @@ void ARMInit(struct ARMCore* cpu) {
 }
 
 void ARMDeinit(struct ARMCore* cpu) {
+	ARMDynarecDeinit(cpu);
 	if (cpu->master->deinit) {
 		cpu->master->deinit(cpu->master);
 	}
@@ -117,6 +120,8 @@ void ARMReset(struct ARMCore* cpu) {
 	cpu->cycles = 0;
 	cpu->nextEvent = 0;
 	cpu->halted = 0;
+
+	ARMDynarecFlush(cpu);
 
 	cpu->irqh.reset(cpu);
 }
@@ -237,6 +242,14 @@ void ARMRun(struct ARMCore* cpu) {
 	}
 	while (cpu->cycles >= cpu->nextEvent) {
 		cpu->irqh.processEvents(cpu);
+	}
+}
+
+void ARMRunOne(struct ARMCore* cpu) {
+	if (cpu->executionMode == MODE_THUMB) {
+		ThumbStep(cpu);
+	} else {
+		ARMStep(cpu);
 	}
 }
 

@@ -354,6 +354,31 @@ static void _GBACoreSetSync(struct mCore* core, struct mCoreSync* sync) {
 	gba->sync = sync;
 }
 
+void GBACoreEnableDynarec(struct mCore* core, bool enable) {
+#ifdef ENABLE_DYNAREC
+	struct ARMCore* cpu = core->cpu;
+	struct GBA* gba = core->board;
+	if (enable && !cpu->dynarec) {
+		ARMDynarecInit(cpu);
+		cpu->dynarec->mapAddress = GBADynarecMapAddress;
+		cpu->dynarec->isWritable = GBADynarecIsWritable;
+		cpu->dynarec->emitMemory = GBADynarecEmitMemory;
+		cpu->dynarec->emitMultiple = GBADynarecEmitMultiple;
+		cpu->dynarec->branchPrefetchReset = &gba->memory.lastPrefetchedPc;
+		GBADynarecInitStubs(cpu);
+	} else if (!enable && cpu->dynarec) {
+		ARMDynarecDeinit(cpu);
+	}
+	if (cpu->dynarec) {
+		// Idle-loop detection assumes interpreter-driven jump patterns
+		gba->idleOptimization = IDLE_LOOP_IGNORE;
+	}
+#else
+	UNUSED(core);
+	UNUSED(enable);
+#endif
+}
+
 static void _GBACoreLoadConfig(struct mCore* core, const struct mCoreConfig* config) {
 	struct GBA* gba = core->board;
 	if (core->opts.mute) {
@@ -386,20 +411,10 @@ static void _GBACoreLoadConfig(struct mCore* core, const struct mCoreConfig* con
 	mCoreConfigGetBoolValue(config, "allowOpposingDirections", &gba->allowOpposingDirections);
 
 #ifdef ENABLE_DYNAREC
-	struct ARMCore* cpu = core->cpu;
 	bool dynarec = false;
 	mCoreConfigGetBoolValue(config, "cpu.dynarec", &dynarec);
-	if (dynarec && !cpu->dynarec) {
-		ARMDynarecInit(cpu);
-		cpu->dynarec->mapAddress = GBADynarecMapAddress;
-		cpu->dynarec->isWritable = GBADynarecIsWritable;
-		cpu->dynarec->emitMemory = GBADynarecEmitMemory;
-		cpu->dynarec->emitMultiple = GBADynarecEmitMultiple;
-		cpu->dynarec->branchPrefetchReset = &gba->memory.lastPrefetchedPc;
-		GBADynarecInitStubs(cpu);
-	} else if (!dynarec && cpu->dynarec) {
-		ARMDynarecDeinit(cpu);
-	}
+	GBACoreEnableDynarec(core, dynarec);
+	struct ARMCore* cpu = core->cpu;
 	if (cpu->dynarec) {
 		int maxBlockLength = 0;
 		if (mCoreConfigGetIntValue(config, "cpu.dynarec.maxBlockLength", &maxBlockLength) && maxBlockLength > 0) {
@@ -408,10 +423,6 @@ static void _GBACoreLoadConfig(struct mCore* core, const struct mCoreConfig* con
 			}
 			cpu->dynarec->maxBlockLength = maxBlockLength;
 		}
-	}
-	if (cpu->dynarec) {
-		// Idle-loop detection assumes interpreter-driven jump patterns
-		gba->idleOptimization = IDLE_LOOP_IGNORE;
 	}
 	mCoreConfigCopyValue(&core->config, config, "cpu.dynarec");
 #endif

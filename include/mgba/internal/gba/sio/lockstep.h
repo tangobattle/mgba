@@ -45,6 +45,9 @@ struct GBASIOLockstepCoordinator {
 
 	uint16_t multiData[4];
 	uint32_t normalData[4];
+
+	// Reschedule-underflow log budget; diagnostic only, never serialized.
+	int underflows;
 };
 
 struct GBASIOLockstepEvent {

@@ -214,7 +214,7 @@ static const int _isRSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
 	/*    SIO */
-	/* 12 */ 1, 1, 1, 1, 0, 0, 0, 0,
+	/* 12 */ 1, 1, 1, 1, 0, 1, 0, 0,
 	/* 13 */ 1, 1, 0, 0, 0, 0, 0, 0,
 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
@@ -259,7 +259,7 @@ static const int _isWSpecialRegister[GBA_REG(INTERNAL_MAX)] = {
 	/* 10 */ 1, 1, 1, 1, 1, 1, 1, 1,
 	/* 11 */ 0, 0, 0, 0, 0, 0, 0, 0,
 	/*    SIO */
-	/* 12 */ 1, 1, 1, 1, 1, 0, 0, 0,
+	/* 12 */ 1, 1, 1, 1, 1, 1, 0, 0,
 	/* 13 */ 1, 1, 1, 0, 0, 0, 0, 0,
 	/* 14 */ 1, 0, 0, 0, 0, 0, 0, 0,
 	/* 15 */ 1, 1, 1, 1, 1, 0, 0, 0,
@@ -1055,6 +1055,18 @@ void GBAIODeserialize(struct GBA* gba, const struct GBASerializedState* state) {
 		}
 	}
 	gba->sio.siocnt = gba->memory.io[GBA_REG(SIOCNT)];
+	// Restore the derived link mode directly before the RCNT write-back
+	// below re-derives it: _switchMode fires the SIO driver's setMode on
+	// a mode edge, and a loaded state on the other side of a link-mode
+	// switch would hand the driver a spurious edge while the machine is
+	// half-restored (a lockstep driver would touch the shared link
+	// state). Deserialization restores state; it must not emit events.
+	unsigned sioMode = ((gba->memory.io[GBA_REG(RCNT)] & 0xC000) | (gba->memory.io[GBA_REG(SIOCNT)] & 0x3000)) >> 12;
+	if (sioMode < 8) {
+		gba->sio.mode = (enum GBASIOMode) (sioMode & 0x3);
+	} else {
+		gba->sio.mode = (enum GBASIOMode) (sioMode & 0xC);
+	}
 	GBASIOWriteRCNT(&gba->sio, gba->memory.io[GBA_REG(RCNT)]);
 
 	LOAD_32(gba->bus, 0, &state->bus);

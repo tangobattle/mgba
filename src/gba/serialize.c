@@ -25,11 +25,29 @@ struct GBABundledState {
 };
 
 void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
+	// A core suspended mid-event-batch by a cooperative SIO driver can be
+	// parked with cpu->cycles == cpu->nextEvent < 0, which is a healthy
+	// live state but one GBADeserialize rejects as corrupted. Rebase it
+	// into masterCycles: only the sum masterCycles + cycles (the current
+	// time) and the distance nextEvent - cycles are meaningful, so the
+	// rebased state runs the same instructions and processes the same
+	// events at the same absolute times.
+	int32_t cycles = gba->cpu->cycles;
+	int32_t nextEvent = gba->cpu->nextEvent;
+	int32_t masterCycles = gba->timing.masterCycles;
+	int64_t globalCycles = gba->timing.globalCycles;
+	if (cycles < 0) {
+		masterCycles += cycles;
+		globalCycles += cycles;
+		nextEvent -= cycles;
+		cycles = 0;
+	}
+
 	STORE_32(GBASavestateMagic + GBASavestateVersion, 0, &state->versionMagic);
 	STORE_32(gba->biosChecksum, 0, &state->biosChecksum);
 	STORE_32(gba->romCrc32, 0, &state->romCrc32);
-	STORE_32(gba->timing.masterCycles, 0, &state->masterCycles);
-	STORE_64LE(gba->timing.globalCycles, 0, &state->globalCycles);
+	STORE_32(masterCycles, 0, &state->masterCycles);
+	STORE_64LE(globalCycles, 0, &state->globalCycles);
 
 	if (gba->memory.rom) {
 		switch (gba->memory.unl.type) {
@@ -54,8 +72,8 @@ void GBASerialize(struct GBA* gba, struct GBASerializedState* state) {
 	}
 	STORE_32(gba->cpu->cpsr.packed, 0, &state->cpu.cpsr.packed);
 	STORE_32(gba->cpu->spsr.packed, 0, &state->cpu.spsr.packed);
-	STORE_32(gba->cpu->cycles, 0, &state->cpu.cycles);
-	STORE_32(gba->cpu->nextEvent, 0, &state->cpu.nextEvent);
+	STORE_32(cycles, 0, &state->cpu.cycles);
+	STORE_32(nextEvent, 0, &state->cpu.nextEvent);
 	for (i = 0; i < 6; ++i) {
 		int j;
 		for (j = 0; j < 7; ++j) {

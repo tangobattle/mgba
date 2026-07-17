@@ -336,6 +336,11 @@ static bool GBASIOLockstepDriverLoadState(struct GBASIODriver* driver, const voi
 	player->otherModes[2] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer2Mode(flags));
 	player->otherModes[3] = _modeIntToEnum(GBASIOLockstepSerializedFlagsGetPlayer3Mode(flags));
 
+	// The event may still be scheduled, from the live pre-restore state
+	// or from a caller restoring a driver blob without a core load in
+	// between; scheduling an already-scheduled event corrupts the timing
+	// list, so always deschedule first.
+	mTimingDeschedule(&driver->p->p->timing, &lockstep->event);
 	if (GBASIOLockstepSerializedFlagsGetEventScheduled(flags)) {
 		int32_t when;
 		LOAD_32LE(when, 0, &state->driver.nextEvent);
@@ -962,6 +967,20 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 			GBASIOLockstepCoordinatorAckPlayer(coordinator, player);
 			break;
 		case SIO_EV_TRANSFER_START:
+			if (player->playerId == 0 || !coordinator->transferActive) {
+				// The transfer this event announced is already dead. Only
+				// secondaries are ever sent TRANSFER_START; if we are the
+				// clock owner we inherited it from the detach that promoted
+				// us — the same detach (or an abort) that tore the transfer
+				// down. Acting on it would flag a phantom transfer busy,
+				// ack a wait nobody holds (parking us outside the sleep
+				// branch, or falsely acking a newer transfer) — and, for
+				// the clock owner, drive the finishCycle reschedule below
+				// non-positive with no sleep branch to catch it: the same
+				// busy-wait the parking fix exists to prevent.
+				mLOG(GBA_SIO, DEBUG, "Discarding stale transfer start from timestamp %X", event->timestamp);
+				break;
+			}
 			_setData(coordinator, player->playerId, sio);
 			nextEvent = event->finishCycle - GBASIOLockstepTime(player) - cyclesLate;
 			player->driver->d.p->siocnt |= 0x80;
@@ -1000,7 +1019,18 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 	}
 
 	if (player->playerId != 0 && nextEvent <= LOCKSTEP_INTERVAL) {
-		if (!player->queue || wasDetach) {
+		// Sleep when there is nothing to do before the next sync point:
+		// the queue is empty (or just a detach echo) — or the player has
+		// fully caught up to the shared clock while its queue head is
+		// still in the future (nextEvent < 1: _untilNextSync <= 0, and
+		// due events were all drained above). The old code busy-waited
+		// in that second case by rescheduling at a non-positive offset,
+		// which relies on another thread advancing the shared clock —
+		// with every core on one thread (mgba-siolink) that never
+		// happens and the timing loop spins forever. Parking is the
+		// correct behavior in both worlds: the clock owner runs,
+		// advances the shared clock, and wakes this player.
+		if (!player->queue || wasDetach || nextEvent < 1) {
 			GBASIOLockstepPlayerSleep(player);
 			// XXX: Is there a better way to gain sync lock at the beginning?
 			if (nextEvent < 4) {
@@ -1009,9 +1039,26 @@ void _lockstepEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 			_verifyAwake(coordinator);
 		}
 	}
+
+	if (nextEvent < 1) {
+		// A non-positive reschedule refires this event at the same
+		// timestamp: with every linked core driven from one thread,
+		// nothing else can advance the shared clock, so the timing
+		// loop spins on this event forever. Asserting instead turns a
+		// recoverable protocol hiccup into an abort of a live session.
+		// Log and clamp: the frame completes, and the host's stall
+		// guards or cross-peer state checks take it from there. The
+		// log budget is coordinator state — per link session, not per
+		// process — so a fresh link always gets its own 32 lines.
+		if (coordinator->underflows < 32) {
+			++coordinator->underflows;
+			mLOG(GBA_SIO, ERROR, "Lockstep reschedule underflow (%i) for player %i; clamping to one interval",
+			     nextEvent, player->playerId);
+		}
+		nextEvent = LOCKSTEP_INTERVAL;
+	}
 	MutexUnlock(&coordinator->mutex);
 
-	mASSERT_DEBUG(nextEvent > 0);
 	mTimingSchedule(timing, &lockstep->event, nextEvent);
 }
 

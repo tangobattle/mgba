@@ -303,6 +303,7 @@ DECL_BITS(GBASerializedHWFlags2, GbpTxPosition, 4, 4);
 
 DECL_BITFIELD(GBASerializedHWFlags3, uint8_t);
 DECL_BITS(GBASerializedHWFlags3, RtcSioOutput, 0, 1);
+DECL_BIT(GBASerializedHWFlags3, SioCompleteScheduled, 1);
 
 DECL_BITFIELD(GBASerializedUnlCartFlags, uint16_t);
 DECL_BITS(GBASerializedUnlCartFlags, Type, 0, 5);

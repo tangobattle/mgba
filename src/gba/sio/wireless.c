@@ -1038,8 +1038,22 @@ static uint32_t _adapterExchange(struct GBASIOWirelessPlayer* player, uint32_t g
 		break;
 	}
 	case WL_SERIAL_DORMANT:
-		// 0x3D: dead to the world until the SD reset pulse.
-		adapter->out = WL_IDLE_WORD;
+		// 0x3D stops the session, but the hardware still hears the
+		// bus: retail librfu revives a stopped adapter by clocking
+		// probe words at it and watching for the login sequence in
+		// the REPLIES — the adapter leads the NINTENDO handshake, and
+		// Emerald's union-room re-init probes five times then gives
+		// up, with no SD pulse anywhere. Any master-clocked exchange
+		// at a dormant adapter is therefore a revival: power on into
+		// a fresh session (peers that still reference us resolve at
+		// the next RF liveness sweep, the same as walking out of
+		// range) and run this word through the login engine. The reply
+		// for THIS exchange was latched from `out` above — often the
+		// 0x3D ack itself, still draining — so the inner exchange's
+		// return value (post-power-on scratch) is dropped rather than
+		// letting the power-on eat the ack.
+		_adapterPowerOn(adapter);
+		_adapterExchange(player, gbaWord);
 		break;
 	case WL_SERIAL_WAITING:
 		// The GBA is supposed to hand us the bus after the 0x25/0x27
@@ -1729,7 +1743,17 @@ void _enqueueEvent(struct GBASIOWirelessCoordinator* coordinator, const struct G
 			continue;
 		}
 		struct GBASIOWirelessPlayer* player = TableLookup(&coordinator->players, coordinator->attachedPlayers[i]);
-		mASSERT_LOG(GBA_SIO, player->freeList, "No free events");
+		if (!player->freeList) {
+			// The pool holds MAX_WIRELESS_EVENTS; a 10+-player attach
+			// (or mass-detach) storm can overflow a queue before its
+			// core runs to drain it. Dropping is sound: ATTACH/DETACH
+			// are bookkeeping the drain ignores (membership truth is
+			// the RF liveness sweep), and RF_TICK can never be the
+			// overflow victim — the ack barrier bounds it to one
+			// outstanding per player.
+			mLOG(GBA_SIO, WARN, "Wireless: event pool exhausted for player %i; dropping type %X", i, event->type);
+			continue;
+		}
 		struct GBASIOWirelessEvent* newEvent = player->freeList;
 		player->freeList = newEvent->next;
 
@@ -1828,17 +1852,23 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 		mLOG(GBA_SIO, DEBUG, "Wireless: player %i connected to host %i as client %i", players[i]->playerId, hostPid, slot);
 	}
 
-	// Refresh broadcast scans.
+	// Refresh broadcast scans. A snapshot holds as many hosts as one
+	// 0x1D reply carries; on airwaves more crowded than that, the fill
+	// window ROTATES with the shared clock so successive polls surface
+	// different hosts — real radios shuffle who wins each scan, and the
+	// union room only learns a player exists by seeing it at least
+	// once. The rotation derives from serialized coordinator state, so
+	// every peer snapshots identically.
+	int rotation = nSlots ? (int) (((uint32_t) coordinator->cycle / RF_TICK_INTERVAL) % (uint32_t) nSlots) : 0;
 	for (i = 0; i < coordinator->nAttached; ++i) {
 		if (!players[i] || !players[i]->adapter.scanning) {
 			continue;
 		}
 		struct GBASIOWirelessAdapter* scanner = &players[i]->adapter;
 		scanner->scanCount = 0;
-		for (j = 0; j < nSlots; ++j) {
-			// A snapshot holds as many hosts as one 0x1D reply carries;
-			// on crowded airwaves the earliest player ids win, exactly
-			// like the strongest signals would.
+		int k;
+		for (k = 0; k < nSlots; ++k) {
+			j = (k + rotation) % nSlots;
 			if (scanner->scanCount >= WL_MAX_SCAN_RESULTS) {
 				break;
 			}

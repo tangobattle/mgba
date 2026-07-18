@@ -810,7 +810,11 @@ static uint16_t GBASIOWirelessDriverWriteSIOCNT(struct GBASIODriver* driver, uin
 		// (slaveHandshake) rather than keyed off a pending event.
 		bool si = GBASIONormalGetSi(old);
 		if (GBASIONormalGetIdleSo(value) && !GBASIONormalGetIdleSo(old)) {
-			si = adapter->slaveHandshake;
+			// Only a slave-mode SO-high asks for the next adapter-clocked
+			// word; a master-mode SO-high is the consumed-word dance and
+			// always drops SI, whatever a torn-down slave session left
+			// behind.
+			si = adapter->slaveHandshake && !GBASIONormalGetSc(value);
 			adapter->slaveHandshake = false;
 		}
 		value = GBASIONormalSetSi(value, si);
@@ -919,6 +923,14 @@ static uint32_t GBASIOWirelessDriverFinishNormal32(struct GBASIODriver* driver) 
 		if (adapter->eventArmed && adapter->evIndex < adapter->evCount) {
 			reply = adapter->evWords[adapter->evIndex];
 			++adapter->evIndex;
+		} else if (adapter->eventArmed && gbaWord == WL_IDLE_WORD) {
+			// The ack transfer carried the idle word instead of the ack:
+			// the GBA reset its slave receive state (librfu's
+			// DMA-collision recovery) and is waiting for a fresh header.
+			// Restart the frame.
+			mLOG(GBA_SIO, DEBUG, "Wireless: event frame restarted");
+			adapter->evIndex = 0;
+			reply = WL_IDLE_WORD;
 		} else if (adapter->eventArmed) {
 			uint8_t ev = adapter->evWords[0] & 0xFF;
 			if ((gbaWord >> 16) != WL_MAGIC || (gbaWord & 0xFF) != (0x80 | ev)) {
@@ -939,6 +951,9 @@ static uint32_t GBASIOWirelessDriverFinishNormal32(struct GBASIODriver* driver) 
 	} else {
 		bool login = player->adapter.serial == WL_SERIAL_LOGIN;
 		reply = _adapterExchange(player, gbaWord);
+		// The GBA clocking us as master proves any slave-mode handshake
+		// debt is dead (see writeSIOCNT).
+		player->adapter.slaveHandshake = false;
 		if (!login) {
 			// Word consumed: raise SI for the GBA's post-transfer
 			// handshake_wait(1). (The login exchange predates the
@@ -961,13 +976,6 @@ static uint32_t _adapterExchange(struct GBASIOWirelessPlayer* player, uint32_t g
 	uint16_t hi = gbaWord >> 16;
 
 	adapter->idleTicks = 0;
-
-	// A login word restarts the handshake from any state but dormancy:
-	// librfu re-logins without necessarily pulsing the reset line first.
-	if (adapter->serial != WL_SERIAL_LOGIN && adapter->serial != WL_SERIAL_DORMANT
-	    && hi != WL_MAGIC && lo == _loginSeq[0]) {
-		_adapterPowerOn(adapter);
-	}
 
 	switch (adapter->serial) {
 	case WL_SERIAL_LOGIN: {
@@ -1003,8 +1011,28 @@ static uint32_t _adapterExchange(struct GBASIOWirelessPlayer* player, uint32_t g
 		// 0x3D: dead to the world until the SD reset pulse.
 		adapter->out = WL_IDLE_WORD;
 		break;
+	case WL_SERIAL_WAITING:
+		// The GBA is supposed to hand us the bus after the 0x25/0x27
+		// ack. Idle master traffic here is probing; a command header is
+		// the GBA abandoning the wait outright (librfu's DMA-collision
+		// recovery does) and taking the bus back — fall into command
+		// parsing, whose stale-state sweep cleans the wait up.
+		if (hi != WL_MAGIC || (lo & 0x80)) {
+			adapter->out = WL_IDLE_WORD;
+			break;
+		}
+		adapter->serial = WL_SERIAL_COMMAND;
+		// fallthrough
 	case WL_SERIAL_COMMAND:
 		if (hi == WL_MAGIC && !(lo & 0x80)) {
+			// The GBA is addressing us as bus master again: any wait or
+			// event frame it walked away from (librfu's DMA-collision
+			// recovery can abandon a slave session at any point) is
+			// dead.
+			adapter->waitPending = false;
+			adapter->eventArmed = false;
+			adapter->evIndex = 0;
+			adapter->evCount = 0;
 			adapter->rxCommand = lo & 0xFF;
 			adapter->rxRemaining = (lo >> 8) & 0xFF;
 			adapter->rxCount = 0;
@@ -1041,11 +1069,6 @@ static uint32_t _adapterExchange(struct GBASIOWirelessPlayer* player, uint32_t g
 		if (adapter->txIndex >= adapter->txCount) {
 			adapter->serial = WL_SERIAL_COMMAND;
 		}
-		break;
-	case WL_SERIAL_WAITING:
-		// The GBA is supposed to hand us the bus after the 0x25/0x27
-		// ack, but it may still clock as master (probing); answer idle.
-		adapter->out = WL_IDLE_WORD;
 		break;
 	}
 	return reply;

@@ -41,8 +41,16 @@
 // per frame.
 #define RF_TICK_INTERVAL 70224
 #define RF_TICKS_PER_FRAME 4
-#define TARGET(P) (1 << (P))
-#define TARGET_ALL 0xF
+// Player targeting rides a 64-bit mask, one bit per playerId — which is
+// what actually bounds one airwave: at most WL_MAX_ATTACHED secondaries
+// park behind player 0. There is no other player cap; the coordinator's
+// structures size themselves to the attached table (a union room's
+// worth of host groups sharing spectrum). TARGET_ALL is filtered
+// against the attached list wherever it's used, so its spare high bits
+// are harmless.
+#define TARGET(P) (UINT64_C(1) << (P))
+#define TARGET_ALL UINT64_MAX
+#define WL_MAX_ATTACHED 63
 
 // Adapter-clocked transfers run at the post-login 2MHz rate.
 #define WL_TRANSFER_CYCLES 256
@@ -76,6 +84,8 @@ enum {
 	WL_CMD_DATA_RX = 0x26,
 	WL_CMD_MS_CHANGE = 0x27,
 	WL_CMD_DISCONNECT = 0x30,
+	WL_CMD_UNK35 = 0x35,
+	WL_CMD_RETRANSMIT_AND_CHANGE = 0x37,
 	WL_CMD_STOP_MODE = 0x3D,
 };
 
@@ -176,7 +186,7 @@ struct GBASIOWirelessSerializedState {
 		uint32_t evWords[2];
 
 		uint32_t scanCount;
-		uint32_t scanResults[(MAX_GBAS - 1) * (WL_BROADCAST_WORDS + 1)];
+		uint32_t scanResults[WL_MAX_SCAN_RESULTS * (WL_BROADCAST_WORDS + 1)];
 
 		struct GBASIOWirelessSerializedMailbox txData;
 		struct GBASIOWirelessSerializedMailbox rxData[WL_MAX_CLIENTS + 1];
@@ -184,12 +194,15 @@ struct GBASIOWirelessSerializedState {
 		uint32_t reservedAdapter[4];
 	} adapter;
 
-	// playerId 0 only
+	// playerId 0 only. The parking mask travels as two explicit LE
+	// halves: a bare uint64_t would 8-align itself and shift every
+	// pinned offset below.
 	struct {
 		int32_t cycle;
-		uint32_t waiting;
 		int32_t nextRfTick;
-		uint32_t reservedCoordinator[5];
+		uint32_t waitingLo;
+		uint32_t waitingHi;
+		uint32_t reservedCoordinator[4];
 	} coordinator;
 };
 // The game-visible adapter state alone — what a boot capture carries so
@@ -206,8 +219,8 @@ struct GBASIOWirelessSerializedAdapterState {
 static_assert(offsetof(struct GBASIOWirelessSerializedState, driver) == 0x10, "GBA wireless savestate driver offset wrong");
 static_assert(offsetof(struct GBASIOWirelessSerializedState, player) == 0x30, "GBA wireless savestate player offset wrong");
 static_assert(offsetof(struct GBASIOWirelessSerializedState, adapter) == 0xC0, "GBA wireless savestate adapter offset wrong");
-static_assert(offsetof(struct GBASIOWirelessSerializedState, coordinator) == 0x484, "GBA wireless savestate coordinator offset wrong");
-static_assert(sizeof(struct GBASIOWirelessSerializedState) == 0x4A4, "GBA wireless savestate struct sized wrong");
+static_assert(offsetof(struct GBASIOWirelessSerializedState, coordinator) == 0x4A0, "GBA wireless savestate coordinator offset wrong");
+static_assert(sizeof(struct GBASIOWirelessSerializedState) == 0x4C0, "GBA wireless savestate struct sized wrong");
 
 static bool GBASIOWirelessDriverInit(struct GBASIODriver* driver);
 static void GBASIOWirelessDriverDeinit(struct GBASIODriver* driver);
@@ -236,7 +249,7 @@ static void _advanceCycle(struct GBASIOWirelessCoordinator*, struct GBASIOWirele
 static void _removePlayer(struct GBASIOWirelessCoordinator*, struct GBASIOWirelessPlayer*);
 static void _reconfigPlayers(struct GBASIOWirelessCoordinator*);
 static int32_t _untilNextSync(struct GBASIOWirelessCoordinator*, struct GBASIOWirelessPlayer*);
-static void _enqueueEvent(struct GBASIOWirelessCoordinator*, const struct GBASIOWirelessEvent*, uint32_t target);
+static void _enqueueEvent(struct GBASIOWirelessCoordinator*, const struct GBASIOWirelessEvent*, uint64_t target);
 static void _rfCommit(struct GBASIOWirelessCoordinator*);
 static void _severAll(struct GBASIOWirelessCoordinator*, bool notify);
 static void _adapterPowerOn(struct GBASIOWirelessAdapter*);
@@ -516,10 +529,10 @@ static void _loadAdapter(struct GBASIOWirelessAdapter* adapter, const struct GBA
 	}
 	LOAD_32LE(scratch, 0, &src->scanCount);
 	adapter->scanCount = scratch;
-	if (adapter->scanCount > MAX_GBAS - 1) {
-		adapter->scanCount = MAX_GBAS - 1;
+	if (adapter->scanCount > WL_MAX_SCAN_RESULTS) {
+		adapter->scanCount = WL_MAX_SCAN_RESULTS;
 	}
-	for (i = 0; i < (MAX_GBAS - 1) * (WL_BROADCAST_WORDS + 1); ++i) {
+	for (i = 0; i < WL_MAX_SCAN_RESULTS * (WL_BROADCAST_WORDS + 1); ++i) {
 		LOAD_32LE(adapter->scanResults[i], 0, &src->scanResults[i]);
 	}
 	_deserializeMailbox(&adapter->txData, &src->txData);
@@ -583,7 +596,7 @@ static void _saveAdapter(struct GBASIOWirelessSerializedAdapter* dst, const stru
 		STORE_32LE(adapter->evWords[i], 0, &dst->evWords[i]);
 	}
 	STORE_32LE(adapter->scanCount, 0, &dst->scanCount);
-	for (i = 0; i < (size_t) (MAX_GBAS - 1) * (WL_BROADCAST_WORDS + 1); ++i) {
+	for (i = 0; i < (size_t) WL_MAX_SCAN_RESULTS * (WL_BROADCAST_WORDS + 1); ++i) {
 		STORE_32LE(adapter->scanResults[i], 0, &dst->scanResults[i]);
 	}
 	_serializeMailbox(&dst->txData, &adapter->txData);
@@ -671,8 +684,12 @@ static bool GBASIOWirelessDriverLoadState(struct GBASIODriver* driver, const voi
 	_loadAdapter(&player->adapter, &state->adapter);
 	if (player->playerId == 0) {
 		LOAD_32LE(coordinator->cycle, 0, &state->coordinator.cycle);
-		LOAD_32LE(coordinator->waiting, 0, &state->coordinator.waiting);
 		LOAD_32LE(coordinator->nextRfTick, 0, &state->coordinator.nextRfTick);
+		uint32_t waitingLo;
+		uint32_t waitingHi;
+		LOAD_32LE(waitingLo, 0, &state->coordinator.waitingLo);
+		LOAD_32LE(waitingHi, 0, &state->coordinator.waitingHi);
+		coordinator->waiting = waitingLo | ((uint64_t) waitingHi << 32);
 	}
 out:
 	MutexUnlock(&coordinator->mutex);
@@ -713,8 +730,9 @@ static void GBASIOWirelessDriverSaveState(struct GBASIODriver* driver, void** st
 	_saveAdapter(&state->adapter, &player->adapter);
 	if (player->playerId == 0) {
 		STORE_32LE(coordinator->cycle, 0, &state->coordinator.cycle);
-		STORE_32LE(coordinator->waiting, 0, &state->coordinator.waiting);
 		STORE_32LE(coordinator->nextRfTick, 0, &state->coordinator.nextRfTick);
+		STORE_32LE((uint32_t) coordinator->waiting, 0, &state->coordinator.waitingLo);
+		STORE_32LE((uint32_t) (coordinator->waiting >> 32), 0, &state->coordinator.waitingHi);
 	}
 	MutexUnlock(&coordinator->mutex);
 
@@ -1386,6 +1404,18 @@ static void _executeCommand(struct GBASIOWirelessPlayer* player) {
 		break;
 	}
 	case WL_CMD_MS_CHANGE:
+	case WL_CMD_UNK35:
+		// 0x35 is undocumented but librfu treats it as a change command
+		// (its ISR includes ack 0xB5 in the switch-to-slave set).
+		_respondAndWait(adapter);
+		break;
+	case WL_CMD_RETRANSMIT_AND_CHANGE:
+		// Host-only: transmit the previous payload again (the send
+		// buffer survives its frame precisely for this) and hand the
+		// bus over.
+		if (adapter->role == WL_ROLE_HOST) {
+			adapter->txDataPending = true;
+		}
 		_respondAndWait(adapter);
 		break;
 	case WL_CMD_DISCONNECT:
@@ -1446,6 +1476,31 @@ void GBASIOWirelessCoordinatorInit(struct GBASIOWirelessCoordinator* coordinator
 void GBASIOWirelessCoordinatorDeinit(struct GBASIOWirelessCoordinator* coordinator) {
 	MutexDeinit(&coordinator->mutex);
 	TableDeinit(&coordinator->players);
+	free(coordinator->attachedPlayers);
+	free(coordinator->tickPlayers);
+	free(coordinator->tickByPid);
+	coordinator->attachedPlayers = NULL;
+	coordinator->tickPlayers = NULL;
+	coordinator->tickByPid = NULL;
+	coordinator->attachedSlots = 0;
+}
+
+// Size the playerId-indexed structures to the player table — the
+// airwaves have no fixed capacity, so they track attachment. The
+// RF-commit scratch rides along so the commit path never allocates.
+// Never below one slot: slot 0 stays readable (as pid 0, never
+// assigned) for the paths that wake the primary unconditionally.
+static void _ensureSlots(struct GBASIOWirelessCoordinator* coordinator, size_t slots) {
+	if (slots < 1) {
+		slots = 1;
+	}
+	if (slots == coordinator->attachedSlots) {
+		return;
+	}
+	coordinator->attachedPlayers = realloc(coordinator->attachedPlayers, slots * sizeof(*coordinator->attachedPlayers));
+	coordinator->tickPlayers = realloc(coordinator->tickPlayers, slots * sizeof(*coordinator->tickPlayers));
+	coordinator->tickByPid = realloc(coordinator->tickByPid, slots * sizeof(*coordinator->tickByPid));
+	coordinator->attachedSlots = slots;
 }
 
 void GBASIOWirelessCoordinatorAttach(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOWirelessDriver* driver) {
@@ -1498,8 +1553,8 @@ void _advanceCycle(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOW
 // Drop every connection on the airwaves and flag the drop so waiting
 // clients get a disconnect event. Called with the lock held.
 static void _severAll(struct GBASIOWirelessCoordinator* coordinator, bool notify) {
-	int i;
-	for (i = 0; i < MAX_GBAS; ++i) {
+	size_t i;
+	for (i = 0; i < coordinator->attachedSlots; ++i) {
 		if (!coordinator->attachedPlayers[i]) {
 			continue;
 		}
@@ -1553,7 +1608,11 @@ void _removePlayer(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOW
 
 void _reconfigPlayers(struct GBASIOWirelessCoordinator* coordinator) {
 	size_t players = TableSize(&coordinator->players);
-	memset(coordinator->attachedPlayers, 0, sizeof(coordinator->attachedPlayers));
+	_ensureSlots(coordinator, players);
+	memset(coordinator->attachedPlayers, 0, coordinator->attachedSlots * sizeof(*coordinator->attachedPlayers));
+	// The parking bitmask holds one bit per playerId; anyone beyond it
+	// simply doesn't get a seat this round.
+	size_t assignable = players < WL_MAX_ATTACHED ? players : WL_MAX_ATTACHED;
 	if (players == 0) {
 		mLOG(GBA_SIO, WARN, "Reconfiguring player IDs with no players attached somehow?");
 	} else if (players == 1) {
@@ -1573,39 +1632,39 @@ void _reconfigPlayers(struct GBASIOWirelessCoordinator* coordinator) {
 			}
 		}
 	} else {
-		struct UIntList playerPreferences[MAX_GBAS];
+		struct UIntList* playerPreferences = malloc(assignable * sizeof(*playerPreferences));
 
-		int i;
-		for (i = 0; i < MAX_GBAS; ++i) {
+		size_t i;
+		for (i = 0; i < assignable; ++i) {
 			UIntListInit(&playerPreferences[i], 4);
 		}
 
-		int seen = 0;
+		size_t seen = 0;
 		struct TableIterator iter;
 		mASSERT_LOG(GBA_SIO, TableIteratorStart(&coordinator->players, &iter), "Trying to reconfigure %" PRIz "u players with empty player list", players);
 		do {
 			unsigned pid = TableIteratorGetKey(&coordinator->players, &iter);
 			struct GBASIOWirelessPlayer* player = TableIteratorGetValue(&coordinator->players, &iter);
-			int requested = MAX_GBAS - 1;
+			int requested = (int) assignable - 1;
 			if (player->driver->user->requestedId) {
 				requested = player->driver->user->requestedId(player->driver->user);
 			}
 			if (requested < 0) {
 				continue;
 			}
-			if (requested >= MAX_GBAS) {
-				requested = MAX_GBAS - 1;
+			if (requested >= (int) assignable) {
+				requested = (int) assignable - 1;
 			}
 
 			*UIntListAppend(&playerPreferences[requested]) = pid;
 			++seen;
-		} while (TableIteratorNext(&coordinator->players, &iter) && seen < MAX_GBAS);
+		} while (TableIteratorNext(&coordinator->players, &iter) && seen < assignable);
 
 		seen = 0;
-		for (i = 0; i < MAX_GBAS; ++i) {
-			int j;
+		for (i = 0; i < assignable; ++i) {
+			size_t j;
 			for (j = 0; j <= i; ++j) {
-				while (UIntListSize(&playerPreferences[j]) && seen < MAX_GBAS) {
+				while (UIntListSize(&playerPreferences[j]) && seen < assignable) {
 					unsigned pid = *UIntListGetPointer(&playerPreferences[j], 0);
 					UIntListShift(&playerPreferences[j], 0, 1);
 					struct GBASIOWirelessPlayer* player = TableLookup(&coordinator->players, pid);
@@ -1614,8 +1673,8 @@ void _reconfigPlayers(struct GBASIOWirelessCoordinator* coordinator) {
 						continue;
 					}
 					coordinator->attachedPlayers[seen] = pid;
-					if (player->playerId != seen) {
-						player->playerId = seen;
+					if (player->playerId != (int) seen) {
+						player->playerId = (int) seen;
 						if (player->driver->user->playerIdChanged) {
 							player->driver->user->playerIdChanged(player->driver->user, player->playerId);
 						}
@@ -1625,14 +1684,15 @@ void _reconfigPlayers(struct GBASIOWirelessCoordinator* coordinator) {
 			}
 		}
 
-		for (i = 0; i < MAX_GBAS; ++i) {
+		for (i = 0; i < assignable; ++i) {
 			UIntListDeinit(&playerPreferences[i]);
 		}
+		free(playerPreferences);
 	}
 
 	int nAttached = 0;
 	size_t i;
-	for (i = 0; i < MAX_GBAS; ++i) {
+	for (i = 0; i < coordinator->attachedSlots; ++i) {
 		unsigned pid = coordinator->attachedPlayers[i];
 		if (!pid) {
 			continue;
@@ -1647,8 +1707,8 @@ void _reconfigPlayers(struct GBASIOWirelessCoordinator* coordinator) {
 	coordinator->nAttached = nAttached;
 }
 
-void _enqueueEvent(struct GBASIOWirelessCoordinator* coordinator, const struct GBASIOWirelessEvent* event, uint32_t target) {
-	mLOG(GBA_SIO, DEBUG, "Wireless: enqueuing event of type %X from %i for target %X at timestamp %X",
+void _enqueueEvent(struct GBASIOWirelessCoordinator* coordinator, const struct GBASIOWirelessEvent* event, uint64_t target) {
+	mLOG(GBA_SIO, DEBUG, "Wireless: enqueuing event of type %X from %i for target %" PRIX64 " at timestamp %X",
 	                      event->type, event->playerId, target, event->timestamp);
 
 	int i;
@@ -1683,15 +1743,20 @@ void _enqueueEvent(struct GBASIOWirelessCoordinator* coordinator, const struct G
 // (transfer completions) are applied by each player's own pump when it
 // wakes.
 static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
-	struct GBASIOWirelessPlayer* players[MAX_GBAS] = {0};
-	struct GBASIOWirelessAdapter* byPid[MAX_GBAS] = {0};
+	// The scratch is sized with the attached table (_ensureSlots), so
+	// the commit path never allocates.
+	struct GBASIOWirelessPlayer** players = coordinator->tickPlayers;
+	struct GBASIOWirelessAdapter** byPid = coordinator->tickByPid;
+	int nSlots = (int) coordinator->attachedSlots;
+	memset(players, 0, coordinator->attachedSlots * sizeof(*players));
+	memset(byPid, 0, coordinator->attachedSlots * sizeof(*byPid));
 	int i, j;
 	for (i = 0; i < coordinator->nAttached; ++i) {
 		if (coordinator->attachedPlayers[i]) {
 			players[i] = TableLookup(&coordinator->players, coordinator->attachedPlayers[i]);
 			if (players[i]) {
 				int pid = players[i]->playerId;
-				if (pid >= 0 && pid < MAX_GBAS) {
+				if (pid >= 0 && pid < nSlots) {
 					byPid[pid] = &players[i]->adapter;
 				}
 			}
@@ -1727,7 +1792,7 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 		struct GBASIOWirelessAdapter* client = &players[i]->adapter;
 		struct GBASIOWirelessAdapter* host = NULL;
 		int hostPid = -1;
-		for (j = 0; j < MAX_GBAS; ++j) {
+		for (j = 0; j < nSlots; ++j) {
 			if (j == players[i]->playerId || !byPid[j]) {
 				continue;
 			}
@@ -1758,7 +1823,13 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 		}
 		struct GBASIOWirelessAdapter* scanner = &players[i]->adapter;
 		scanner->scanCount = 0;
-		for (j = 0; j < MAX_GBAS; ++j) {
+		for (j = 0; j < nSlots; ++j) {
+			// A snapshot holds as many hosts as one 0x1D reply carries;
+			// on crowded airwaves the earliest player ids win, exactly
+			// like the strongest signals would.
+			if (scanner->scanCount >= WL_MAX_SCAN_RESULTS) {
+				break;
+			}
 			if (j == players[i]->playerId || !byPid[j] || !byPid[j]->broadcasting) {
 				continue;
 			}
@@ -1782,7 +1853,7 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 		struct GBASIOWirelessAdapter* adapter = &players[i]->adapter;
 		if (adapter->role == WL_ROLE_CLIENT && adapter->clientNumber >= 0) {
 			struct GBASIOWirelessAdapter* host = NULL;
-			if (adapter->hostPlayer >= 0 && adapter->hostPlayer < MAX_GBAS) {
+			if (adapter->hostPlayer >= 0 && adapter->hostPlayer < nSlots) {
 				host = byPid[adapter->hostPlayer];
 			}
 			bool live = host && host->role == WL_ROLE_HOST
@@ -1801,7 +1872,7 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 					continue;
 				}
 				int clientPid = adapter->clientPlayers[slot];
-				struct GBASIOWirelessAdapter* client = clientPid >= 0 && clientPid < MAX_GBAS ? byPid[clientPid] : NULL;
+				struct GBASIOWirelessAdapter* client = clientPid >= 0 && clientPid < nSlots ? byPid[clientPid] : NULL;
 				bool live = client && client->role == WL_ROLE_CLIENT
 				    && client->clientNumber == slot
 				    && client->hostPlayer == players[i]->playerId;
@@ -1832,7 +1903,7 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 				continue;
 			}
 			int clientPid = host->clientPlayers[slot];
-			struct GBASIOWirelessAdapter* client = clientPid >= 0 && clientPid < MAX_GBAS ? byPid[clientPid] : NULL;
+			struct GBASIOWirelessAdapter* client = clientPid >= 0 && clientPid < nSlots ? byPid[clientPid] : NULL;
 			if (!client) {
 				continue;
 			}
@@ -1842,10 +1913,8 @@ static void _rfCommit(struct GBASIOWirelessCoordinator* coordinator) {
 				client->txDataPending = false;
 				host->rxData[1 + slot] = client->txData;
 				host->rxFresh = true;
-				client->txData.length = 0;
 			}
 		}
-		host->txData.length = 0;
 	}
 
 	// Wake adapters waiting on the airwaves: a severed connection, an
@@ -1998,7 +2067,7 @@ void GBASIOWirelessCoordinatorWaitOnPlayers(struct GBASIOWirelessCoordinator* co
 
 	_advanceCycle(coordinator, player);
 	mLOG(GBA_SIO, DEBUG, "Wireless: primary waiting for players to ack");
-	coordinator->waiting = ((1 << coordinator->nAttached) - 1) & ~TARGET(player->playerId);
+	coordinator->waiting = (TARGET(coordinator->nAttached) - 1) & ~TARGET(player->playerId);
 	GBASIOWirelessPlayerSleep(player);
 	GBASIOWirelessCoordinatorWakePlayers(coordinator);
 

@@ -40,6 +40,13 @@ CXX_GUARD_START
 #define WL_MAX_CLIENTS 4
 #define WL_HOST_DATA_BYTES 87
 #define WL_CLIENT_DATA_BYTES 16
+// How many broadcast entries one 0x1D reply carries: a reply caps at
+// WL_MAX_REPLY_WORDS words and each visible host costs seven. This
+// bounds a scanner's *snapshot*, not the airwaves: the coordinator
+// itself holds any number of players (a union room's worth of host
+// groups sharing spectrum), bounded only by the 64-bit parking
+// bitmask — see GBASIOWirelessCoordinator.
+#define WL_MAX_SCAN_RESULTS 4
 
 enum GBASIOWirelessEventType {
 	WL_EV_ATTACH,
@@ -150,7 +157,7 @@ struct GBASIOWirelessAdapter {
 	// Latest broadcast scan snapshot, taken at an RF tick while scanning:
 	// per visible host, the serverId word plus the six broadcast words.
 	uint8_t scanCount;
-	uint32_t scanResults[(MAX_GBAS - 1) * (WL_BROADCAST_WORDS + 1)];
+	uint32_t scanResults[WL_MAX_SCAN_RESULTS * (WL_BROADCAST_WORDS + 1)];
 };
 
 struct GBASIOWirelessCoordinator {
@@ -159,9 +166,19 @@ struct GBASIOWirelessCoordinator {
 
 	unsigned nextId;
 
-	unsigned attachedPlayers[MAX_GBAS];
+	// PlayerId-ordered attachment, sized to the player table by
+	// _reconfigPlayers — the airwaves have no fixed capacity. The only
+	// machinery bound is the parking bitmask: `waiting` holds one bit
+	// per player, so at most 63 secondaries park behind player 0.
+	unsigned* attachedPlayers;
+	size_t attachedSlots;
+	// RF-commit scratch (players in id order, adapters by playerId),
+	// resized alongside attachedPlayers so the commit allocates
+	// nothing.
+	struct GBASIOWirelessPlayer** tickPlayers;
+	struct GBASIOWirelessAdapter** tickByPid;
 	int nAttached;
-	uint32_t waiting;
+	uint64_t waiting;
 
 	int32_t cycle;
 	int32_t nextRfTick;

@@ -266,6 +266,18 @@ static uint16_t _deviceId(int playerId) {
 	return 0x61F0 + playerId;
 }
 
+// Difference between two cycle-counter values, valid across the int32
+// wrap: the counters (mTimingCurrentTime and everything derived from
+// it) advance mod 2^32 and cross the sign boundary ~128 emulated
+// seconds after reset. Naive `a - b >= 0` is signed-overflow UB there —
+// and compilers fold it to a direct `a >= b`, which then fails for an
+// entire half-period, freezing the shared clock. Unsigned subtraction
+// reinterpreted as signed is the same windowed-distance idiom mTiming
+// itself uses.
+static int32_t _cycleDiff(int32_t later, int32_t earlier) {
+	return (int32_t) ((uint32_t) later - (uint32_t) earlier);
+}
+
 static void _verifyAwake(struct GBASIOWirelessCoordinator* coordinator) {
 #ifdef NDEBUG
 	UNUSED(coordinator);
@@ -379,7 +391,7 @@ static void GBASIOWirelessDriverReset(struct GBASIODriver* driver) {
 		}
 		bool hadOthers = TableSize(&coordinator->players) > 1;
 		_reconfigPlayers(coordinator);
-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
+		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
 		if (player->playerId != 0) {
 			struct GBASIOWirelessEvent event = {
 				.type = WL_EV_ATTACH,
@@ -399,7 +411,7 @@ static void GBASIOWirelessDriverReset(struct GBASIODriver* driver) {
 	} else {
 		MutexLock(&coordinator->mutex);
 		player = TableLookup(&coordinator->players, wireless->wirelessId);
-		player->cycleOffset = mTimingCurrentTime(&driver->p->p->timing) - coordinator->cycle;
+		player->cycleOffset = _cycleDiff(mTimingCurrentTime(&driver->p->p->timing), coordinator->cycle);
 		// A core reset power-cycles the adapter.
 		_adapterPowerOn(&player->adapter);
 	}
@@ -1532,7 +1544,7 @@ size_t GBASIOWirelessCoordinatorAttached(struct GBASIOWirelessCoordinator* coord
 }
 
 int32_t _untilNextSync(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOWirelessPlayer* player) {
-	int32_t cycle = coordinator->cycle - GBASIOWirelessTime(player);
+	int32_t cycle = _cycleDiff(coordinator->cycle, GBASIOWirelessTime(player));
 	if (player->playerId == 0) {
 		if (coordinator->nAttached < 2) {
 			cycle += UNLOCKED_INTERVAL;
@@ -1545,8 +1557,8 @@ int32_t _untilNextSync(struct GBASIOWirelessCoordinator* coordinator, struct GBA
 
 void _advanceCycle(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOWirelessPlayer* player) {
 	int32_t newCycle = GBASIOWirelessTime(player);
-	mASSERT_DEBUG(newCycle - coordinator->cycle >= 0);
-	coordinator->nextRfTick -= newCycle - coordinator->cycle;
+	mASSERT_DEBUG(_cycleDiff(newCycle, coordinator->cycle) >= 0);
+	coordinator->nextRfTick -= _cycleDiff(newCycle, coordinator->cycle);
 	coordinator->cycle = newCycle;
 }
 
@@ -1725,7 +1737,7 @@ void _enqueueEvent(struct GBASIOWirelessCoordinator* coordinator, const struct G
 		struct GBASIOWirelessEvent** previous = &player->queue;
 		struct GBASIOWirelessEvent* next = player->queue;
 		while (next) {
-			int32_t until = newEvent->timestamp - next->timestamp;
+			int32_t until = _cycleDiff(newEvent->timestamp, next->timestamp);
 			if (until < 0) {
 				break;
 			}
@@ -1967,7 +1979,7 @@ void _wirelessEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 		                      player->queue->playerId, player->queue->timestamp);
 		wasDetach = true;
 	}
-	if (player->playerId == 0 && GBASIOWirelessTime(player) - coordinator->cycle >= 0) {
+	if (player->playerId == 0 && _cycleDiff(GBASIOWirelessTime(player), coordinator->cycle) >= 0) {
 		// We are the clock owner; advance the shared clock. (If we just
 		// became the owner via a detach we may briefly lag it.)
 		_advanceCycle(coordinator, player);
@@ -1996,7 +2008,7 @@ void _wirelessEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 		if (!event) {
 			break;
 		}
-		if (event->timestamp > GBASIOWirelessTime(player)) {
+		if (_cycleDiff(event->timestamp, GBASIOWirelessTime(player)) > 0) {
 			break;
 		}
 		player->queue = event->next;
@@ -2015,8 +2027,8 @@ void _wirelessEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 		event->next = player->freeList;
 		player->freeList = event;
 	}
-	if (player->queue && player->queue->timestamp - GBASIOWirelessTime(player) < nextEvent) {
-		nextEvent = player->queue->timestamp - GBASIOWirelessTime(player);
+	if (player->queue && _cycleDiff(player->queue->timestamp, GBASIOWirelessTime(player)) < nextEvent) {
+		nextEvent = _cycleDiff(player->queue->timestamp, GBASIOWirelessTime(player));
 	}
 
 	// Apply any airwaves consequences to our own core: an armed event
@@ -2054,7 +2066,7 @@ void _wirelessEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) 
 }
 
 int32_t GBASIOWirelessTime(struct GBASIOWirelessPlayer* player) {
-	return mTimingCurrentTime(&player->driver->d.p->p->timing) - player->cycleOffset;
+	return _cycleDiff(mTimingCurrentTime(&player->driver->d.p->p->timing), player->cycleOffset);
 }
 
 void GBASIOWirelessCoordinatorWaitOnPlayers(struct GBASIOWirelessCoordinator* coordinator, struct GBASIOWirelessPlayer* player) {

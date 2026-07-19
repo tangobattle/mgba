@@ -28,7 +28,7 @@ CXX_GUARD_START
 //
 // The coordinator reuses the cooperative lockstep model: one thread
 // drives every core, mLockstepUser sleep/wake park a caught-up core, and
-// player 0 owns the shared clock.
+// the lowest attached playerId owns the shared clock.
 
 #define MAX_WIRELESS_EVENTS 8
 
@@ -47,6 +47,11 @@ CXX_GUARD_START
 // groups sharing spectrum), bounded only by the 64-bit parking
 // bitmask — see GBASIOWirelessCoordinator.
 #define WL_MAX_SCAN_RESULTS 4
+// The most adapters one airwave seats: the parking bitmask (`waiting`)
+// holds one bit per playerId, and the seat arrays below are sized to
+// match. The player table itself is uncapped; anyone past the last free
+// seat simply doesn't get one this round.
+#define WL_MAX_ATTACHED 63
 
 enum GBASIOWirelessEventType {
 	WL_EV_ATTACH,
@@ -166,18 +171,21 @@ struct GBASIOWirelessCoordinator {
 
 	unsigned nextId;
 
-	// PlayerId-ordered attachment, sized to the player table by
-	// _reconfigPlayers — the airwaves have no fixed capacity. The only
-	// machinery bound is the parking bitmask: `waiting` holds one bit
-	// per player, so at most 63 secondaries park behind player 0.
-	unsigned* attachedPlayers;
-	size_t attachedSlots;
-	// RF-commit scratch (players in id order, adapters by playerId),
-	// resized alongside attachedPlayers so the commit allocates
-	// nothing.
-	struct GBASIOWirelessPlayer** tickPlayers;
-	struct GBASIOWirelessAdapter** tickByPid;
+	// PlayerId-indexed attachment (wirelessId per pid, 0 = vacant).
+	// Ids are STABLE: a player keeps its id for as long as it is
+	// attached, and a departure leaves a hole rather than renumbering
+	// the survivors (renumbering would change every game-visible device
+	// id and dangle every connection reference). New attachments claim
+	// their requested id if it is free, else the lowest hole.
+	unsigned attachedPlayers[WL_MAX_ATTACHED];
 	int nAttached;
+	// The clock owner: the lowest attached playerId (-1 when empty).
+	// With stable ids the owner is not necessarily id 0 — a departure
+	// can leave the airwaves ownerless at 0, and a lone continuation
+	// keeps whatever id it held when its peers were still in range.
+	int owner;
+	// One bit per attached playerId; WaitOnPlayers' parking mask.
+	uint64_t attachedMask;
 	uint64_t waiting;
 
 	int32_t cycle;
@@ -222,8 +230,15 @@ void GBASIOWirelessDriverCreate(struct GBASIOWirelessDriver*, struct mLockstepUs
 // a boot capture carries so a link rebuilt mid-session resumes every
 // adapter where it was — the players walk into RF range with their
 // sessions intact. Load after the driver is installed on its core.
+//
+// The capture also records the adapter's playerId. A rebuild should ask
+// for it back (mLockstepUser::requestedId) when creating the driver:
+// keeping the id keeps the device id and every connection reference
+// valid, so surviving pairs stay connected across the rebuild. PlayerId
+// peeks at a capture's stored id (-1 if the blob is old or invalid).
 void GBASIOWirelessDriverSaveAdapterState(struct GBASIOWirelessDriver*, void** state, size_t* size);
 bool GBASIOWirelessDriverLoadAdapterState(struct GBASIOWirelessDriver*, const void* state, size_t size);
+int GBASIOWirelessAdapterStatePlayerId(const void* state, size_t size);
 
 CXX_GUARD_END
 

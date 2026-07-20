@@ -443,7 +443,13 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState* 
 		STORE_16(audio->currentSamples[i].left, 0, &state->currentSamples[i].left);
 		STORE_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
 	}
-	STORE_32(audio->lastSample, 0, &state->audio.lastSample);
+	// Relative, like every other timing anchor: the serialize-side
+	// negative-cycle rebase shifts the state's clock relative to the
+	// live one, so an absolute timestamp desyncs the sampling grid on
+	// exactly the saves where the rebase fired (audible as duty-edge
+	// jitter in rollback re-simulation). Old states hold an absolute
+	// value; the ExactFrequency flag marks the relative representation.
+	STORE_32(audio->lastSample - mTimingCurrentTime(&audio->p->timing), 0, &state->audio.lastSample);
 
 	int readA = audio->chA.fifoRead;
 	int readB = audio->chB.fifoRead;
@@ -516,6 +522,11 @@ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState
 		LOAD_16(audio->currentSamples[i].right, 0, &state->currentSamples[i].right);
 	}
 	LOAD_32(audio->lastSample, 0, &state->audio.lastSample);
+	uint32_t psgFlags;
+	LOAD_32LE(psgFlags, 0, &state->audio.flags);
+	if (GBSerializedAudioFlagsGetExactFrequency(psgFlags)) {
+		audio->lastSample += mTimingCurrentTime(&audio->p->timing);
+	}
 
 	int readA = 0;
 	int readB = 0;
@@ -553,4 +564,10 @@ void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState
 		audio->lastSample = when - SAMPLE_INTERVAL;
 	}
 	mTimingSchedule(&audio->p->timing, &audio->sampleEvent, when);
+
+	// Last, AFTER the register-write replays above: the sound registers
+	// read back with their frequency bits masked (write-only), so the
+	// replay just clobbered every channel's frequency-class state with
+	// the masked values. Restore the exact fields the fork serializes.
+	GBAudioPSGDeserializeExact(&audio->psg, &state->audio.psg, &state->audio.flags);
 }

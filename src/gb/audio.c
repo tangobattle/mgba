@@ -1013,6 +1013,11 @@ void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGStat
 	sweep = GBSerializedAudioSweepSetTime(sweep, audio->ch1.sweep.time & 7);
 	STORE_32LE(ch1Flags, 0, &state->ch1.envelope);
 	STORE_32LE(sweep, 0, &state->ch1.sweep);
+	flags = GBSerializedAudioFlagsSetExactFrequency(flags, 1);
+	STORE_32LE(audio->ch1.control.frequency, 0, &state->ch1.reserved);
+	STORE_32LE(audio->ch2.control.frequency, 0, &state->ch2.reserved[0]);
+	STORE_32LE(audio->ch4.ratio | (audio->ch4.frequency << 4) | (audio->ch4.power << 8), 0, &state->ch2.reserved[1]);
+	STORE_16LE(audio->ch3.rate, 0, &state->ch3.reserved);
 	STORE_32LE(audio->ch1.lastUpdate - mTimingCurrentTime(audio->timing), 0, &state->ch1.lastUpdate);
 
 	flags = GBSerializedAudioFlagsSetCh2Volume(flags, audio->ch2.envelope.currentVolume);
@@ -1120,6 +1125,35 @@ void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGSt
 	}
 	audio->ch4.nSamples = 0;
 	audio->ch4.samples = 0;
+
+	// The output latches are pure functions of the state restored above,
+	// but the mixer reads them directly between duty steps — left stale,
+	// a rollback restore keeps voicing the pre-restore phase for up to a
+	// full duty step (~32 output samples of the wrong level whenever an
+	// edge sits between the restore point and the revoked future).
+	_updateSquareSample(&audio->ch1);
+	_updateSquareSample(&audio->ch2);
+}
+
+void GBAudioPSGDeserializeExact(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn) {
+	uint32_t flags;
+	uint32_t value;
+	uint16_t rate;
+	LOAD_32LE(flags, 0, flagsIn);
+	if (!GBSerializedAudioFlagsGetExactFrequency(flags)) {
+		// Pre-fork state: leave the register-replay derivation in place.
+		return;
+	}
+	LOAD_32LE(value, 0, &state->ch1.reserved);
+	audio->ch1.control.frequency = value & 0x7FF;
+	LOAD_32LE(value, 0, &state->ch2.reserved[0]);
+	audio->ch2.control.frequency = value & 0x7FF;
+	LOAD_32LE(value, 0, &state->ch2.reserved[1]);
+	audio->ch4.ratio = value & 0x7;
+	audio->ch4.frequency = (value >> 4) & 0xF;
+	audio->ch4.power = (value >> 8) & 1;
+	LOAD_16LE(rate, 0, &state->ch3.reserved);
+	audio->ch3.rate = rate & 0x7FF;
 }
 
 void GBAudioSerialize(const struct GBAudio* audio, struct GBSerializedState* state) {

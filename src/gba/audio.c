@@ -499,6 +499,13 @@ void GBAAudioSerialize(const struct GBAAudio* audio, struct GBASerializedState* 
 void GBAAudioDeserialize(struct GBAAudio* audio, const struct GBASerializedState* state) {
 	GBAudioPSGDeserialize(&audio->psg, &state->audio.psg, &state->audio.flags);
 
+	// SOUNDCNT_X raw-loads (no write replay), so restore its decoded
+	// master-enable field explicitly; everything the write handler
+	// would have derived beyond it is serialized elsewhere.
+	uint16_t soundcntX;
+	LOAD_16(soundcntX, GBA_REG_SOUNDCNT_X, state->io);
+	audio->enable = !!(soundcntX & 0x80);
+
 	LOAD_32(audio->chA.internalSample, 0, &state->audio.internalA);
 	LOAD_32(audio->chB.internalSample, 0, &state->audio.internalB);
 	memcpy(audio->chA.samples, state->samples.chA, sizeof(audio->chA.samples));

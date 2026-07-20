@@ -247,7 +247,6 @@ void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right);
 struct GBSerializedPSGState;
 void GBAudioPSGSerialize(const struct GBAudio* audio, struct GBSerializedPSGState* state, uint32_t* flagsOut);
 void GBAudioPSGDeserialize(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn);
-void GBAudioPSGDeserializeExact(struct GBAudio* audio, const struct GBSerializedPSGState* state, const uint32_t* flagsIn);
 
 struct GBSerializedState;
 void GBAudioSerialize(const struct GBAudio* audio, struct GBSerializedState* state);

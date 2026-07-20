@@ -211,34 +211,105 @@ DECL_BIT(GBSerializedAudioFlags, Ch1SweepEnabled, 25);
 DECL_BIT(GBSerializedAudioFlags, Ch1SweepOccurred, 26);
 DECL_BIT(GBSerializedAudioFlags, Ch3Readable, 27);
 DECL_BIT(GBSerializedAudioFlags, SkipFrame, 28);
-DECL_BIT(GBSerializedAudioFlags, ExactFrequency, 31);
+// ch3's decoded GBA volume — round-tripped in spare flag bits (see the PSG
+// state struct's frequency/duty/rate fields for the why).
+DECL_BITS(GBSerializedAudioFlags, Ch3Volume, 29, 3);
+// Length-enable ("stop", NRx4 bit 6) flags: their only restore path was the
+// SOUNDxCNT_X write replay that the deserialize no longer performs. A stale
+// stop=true from the pre-load timeline makes the (correctly restored) frame
+// sequencer run the (correctly restored) length counter down to zero and
+// silence the channel — and the per-frame re-save then bakes the dead channel
+// into every later snapshot, so the dropout persists until the game happens
+// to retrigger. Bits 7 and 15 are the flags word's only free bits; ch3's and
+// ch4's stop flags live in their channels' own spare bits.
+DECL_BIT(GBSerializedAudioFlags, Ch1Stop, 7);
+DECL_BIT(GBSerializedAudioFlags, Ch2Stop, 15);
 
 DECL_BITFIELD(GBSerializedAudioEnvelope, uint32_t);
 DECL_BITS(GBSerializedAudioEnvelope, Length, 0, 7);
 DECL_BITS(GBSerializedAudioEnvelope, NextStep, 7, 3);
 DECL_BITS(GBSerializedAudioEnvelope, Frequency, 10, 11);
 DECL_BITS(GBSerializedAudioEnvelope, DutyIndex, 21, 3);
+// ch4 has no reserved struct slot, so its decoded noise control round-trips in
+// the unused high bits of its envelope word (square channels don't use these).
+DECL_BITS(GBSerializedAudioEnvelope, NoiseRatio, 24, 3);
+DECL_BITS(GBSerializedAudioEnvelope, NoiseFrequency, 27, 4);
+DECL_BIT(GBSerializedAudioEnvelope, NoisePower, 31);
+// Envelope auto-volume sweep params (stepTime/direction/initialVolume): the
+// NRx2 handlers set them but they were never serialized, so a load_state left
+// them stale and _updateEnvelope stepped the wrong direction / period under
+// Tango's per-frame deserialize — audible as crunch on sustained PSG notes
+// (currentVolume IS restored, but the next envelope step then corrupts it). The
+// square channels store them in the high bits they leave free; ch4 (noise)
+// reuses the frequency/duty-index bits it never uses.
+DECL_BITS(GBSerializedAudioEnvelope, SquareStepTime, 24, 3);
+DECL_BIT(GBSerializedAudioEnvelope, SquareDirection, 27);
+DECL_BITS(GBSerializedAudioEnvelope, SquareInitialVolume, 28, 4);
+DECL_BITS(GBSerializedAudioEnvelope, NoiseStepTime, 10, 3);
+DECL_BIT(GBSerializedAudioEnvelope, NoiseDirection, 13);
+DECL_BITS(GBSerializedAudioEnvelope, NoiseInitialVolume, 14, 4);
+DECL_BIT(GBSerializedAudioEnvelope, NoiseStop, 18);
 
 DECL_BITFIELD(GBSerializedAudioSweep, uint32_t);
 DECL_BITS(GBSerializedAudioSweep, Time, 0, 3);
+// NR10's decoded sweep params and the live countdown toward the next sweep
+// tick. These can't be re-derived by replaying NR10 on load: _writeSweep's
+// negate-exit quirk reads the pre-load `occurred` flag and can spuriously
+// kill ch1, and `step` isn't register-backed at all. Stale shift/direction
+// make _updateSweep slide to the wrong frequency or overflow-kill ch1.
+DECL_BITS(GBSerializedAudioSweep, Shift, 3, 3);
+DECL_BIT(GBSerializedAudioSweep, Direction, 6);
+DECL_BITS(GBSerializedAudioSweep, Step, 7, 4);
+
+// ch3's rate only needs 11 bits of its slot; the rest round-trips the decoded
+// SOUND3CNT_LO fields (the register is no longer replayed on load). Stale
+// bank/size corrupt the GBA wave-RAM rotation window; a stale enable=false
+// makes every retrigger during re-simulation fail, muting ch3.
+DECL_BITFIELD(GBSerializedAudioCh3Rate, uint16_t);
+DECL_BITS(GBSerializedAudioCh3Rate, Rate, 0, 11);
+DECL_BIT(GBSerializedAudioCh3Rate, Stop, 11);
+DECL_BIT(GBSerializedAudioCh3Rate, Enable, 12);
+DECL_BIT(GBSerializedAudioCh3Rate, Bank, 13);
+DECL_BIT(GBSerializedAudioCh3Rate, Size, 14);
 
 struct GBSerializedPSGState {
 	struct {
 		GBSerializedAudioEnvelope envelope;
 		int32_t nextFrame;
-		int32_t reserved;
+		// Decoded control fields the SOUNDxCNT_* handlers set but that weren't
+		// otherwise serialized — a load_state left them stale and the PSG
+		// channels resampled at the wrong pitch/duty (audible as crunch under
+		// Tango's per-frame deserialize). Round-tripped in the reserved slots
+		// as decoded values (sweep-adjusted frequency included), so the struct
+		// size is unchanged.
+		uint16_t frequency;
+		uint8_t duty;
+		// ch3's/ch4's current output samples (parked in the square channels'
+		// spare bytes). The channels only refresh `sample` when their next
+		// wave/LFSR step comes due, so after a load the pre-load value keeps
+		// sounding until then — and the io-replay during deserialize actively
+		// clobbers it via GBAudioRun. ch1/ch2 need no slot: their sample is
+		// the invariant duty[index]*currentVolume, recomputed on load.
+		int8_t ch3Sample;
 		GBSerializedAudioSweep sweep;
 		uint32_t lastUpdate;
 	} ch1;
 	struct {
 		GBSerializedAudioEnvelope envelope;
-		int32_t reserved[2];
+		uint16_t frequency;
+		uint8_t duty;
+		int8_t ch4Sample;
+		// ch4's between-flush averaging accumulators (nSamples/samples) —
+		// parked in ch2's spare slot because ch4's struct has none. They're
+		// flushed every output sample, so int16 is ample.
+		int16_t ch4NSamples;
+		int16_t ch4Samples;
 		uint32_t lastUpdate;
 	} ch2;
 	struct {
 		uint32_t wavebanks[8];
 		int16_t length;
-		int16_t reserved;
+		GBSerializedAudioCh3Rate rate;
 		uint32_t nextEvent;
 	} ch3;
 	struct {

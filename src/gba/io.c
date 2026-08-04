@@ -767,8 +767,12 @@ bool GBAIOIsReadConstant(uint32_t address) {
 }
 
 uint16_t GBAIORead(struct GBA* gba, uint32_t address) {
-	if (!GBAIOIsReadConstant(address)) {
-		// Most IO reads need to disable idle removal
+	// Most IO reads need to disable idle removal — but only a pending
+	// halt can be disabled, and one is only ever pending while an idle
+	// loop is known. Ask the flag before the switch: clearing what is
+	// already clear is the same nothing, and this ran on every IO read
+	// a game made.
+	if (UNLIKELY(gba->haltPending) && !GBAIOIsReadConstant(address)) {
 		gba->haltPending = false;
 	}
 
